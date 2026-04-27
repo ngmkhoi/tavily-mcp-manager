@@ -1,0 +1,25 @@
+{
+  "name": "tavily-mcp-manager",
+  "version": "0.1.1",
+  "description": "CLI and MCP wrapper for managing switchable Tavily API keys in Codex.",
+  "license": "MIT",
+  "keywords": [
+    "tavily",
+    "mcp",
+    "codex",
+    "cli"
+  ],
+  "bin": {
+    "tavily-manager": "./dist/cli.js",
+    "tavily-mcp-manager": "./dist/mcp-wrapper.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "bash -n src/cli/tavily-manager src/mcp/tavily-mcp-manager && node --check dist/cli.js && node --check dist/mcp-wrapper.js",
+    "prepack": "npm run check"
+  }
+}

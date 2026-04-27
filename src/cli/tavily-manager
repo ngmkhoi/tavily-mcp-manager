@@ -1,0 +1,1116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tavily_home="${TAVILY_HOME:-$HOME/.codex/tavily}"
+keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
+config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
+legacy_active_file="${TAVILY_ACTIVE_FILE:-$tavily_home/active-key}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+usage() {
+  {
+    headline
+    section_title "Commands"
+    printf '  %s\n' "${bold}Key setup${reset}"
+    printf '    %-30s %s\n' "init" "create local storage"
+    printf '    %-30s %s\n' "add <api-key> [--alias <label>]" "save a new Tavily key"
+    printf '    %-30s %s\n' "switch <slot|alias>" "make a key active"
+    printf '    %-30s %s\n' "current" "show the active key"
+    printf '    %-30s %s\n' "list" "show saved keys"
+    printf '\n'
+    printf '  %s\n' "${bold}Maintenance${reset}"
+    printf '    %-30s %s\n' "key add <api-key> [--alias <label>]" "save a new Tavily key"
+    printf '    %-30s %s\n' "key rename <slot|alias> <alias>" "rename an alias"
+    printf '    %-30s %s\n' "key remove <slot|alias>" "remove a key"
+    printf '    %-30s %s\n' "usage [current|all|slot|alias]" "check credits"
+    printf '    %-30s %s\n' "rotate [options]" "switch to the key with most credits"
+    printf '\n'
+    printf '  %s\n' "${bold}MCP${reset}"
+    printf '    %-30s %s\n' "doctor" "check local setup"
+    printf '    %-30s %s\n' "mcp status" "show wrapper runtime status"
+    printf '    %-30s %s\n' "mcp config codex" "print Codex TOML config"
+    printf '\n'
+    printf '  %s\n' "${dim}Rotate options: --dry-run --min-remaining <percent> --only-if-current-below <percent>${reset}"
+  } >&2
+}
+
+use_color=0
+if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
+  use_color=1
+fi
+
+color() {
+  local code="$1"
+  if [[ "$use_color" == "1" ]]; then
+    printf '\033[%sm' "$code"
+  fi
+}
+
+reset="$(color 0)"
+bold="$(color 1)"
+dim="$(color 2)"
+green="$(color 32)"
+yellow="$(color 33)"
+red="$(color 31)"
+cyan="$(color 36)"
+blue="$(color 34)"
+
+headline() {
+  printf '%s\n' "${bold}${cyan}Tavily Manager${reset} ${dim}key rotation for tavily-mcp${reset}"
+  printf '%s\n' "${dim}----------------------------------------${reset}"
+  printf '\n'
+}
+
+section_title() {
+  printf '%s%s%s\n' "$bold" "$1" "$reset"
+}
+
+ui_kv() {
+  local key="$1"
+  local value="$2"
+  printf '  %s%-13s%s %b\n' "$dim" "$key" "$reset" "$value"
+}
+
+ui_status() {
+  local label="$1"
+  local value="$2"
+  local color_value="${3:-$green}"
+  printf '  %b%-13s%b %b\n' "$color_value" "$label" "$reset" "${color_value}${value}${reset}"
+}
+
+ui_empty() {
+  printf '  %s%s%s\n' "$dim" "$1" "$reset"
+}
+
+mask_key() {
+  local key="$1"
+  local prefix="${key:0:14}"
+  local suffix="${key: -6}"
+  printf '%s...%s' "$prefix" "$suffix"
+}
+
+store_node() {
+  node - "$@" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const command = process.argv[2];
+const args = process.argv.slice(3);
+const configFile = process.env.TAVILY_CONFIG_FILE_PATH;
+const keysFile = process.env.TAVILY_KEYS_FILE_PATH;
+const legacyActiveFile = process.env.TAVILY_LEGACY_ACTIVE_FILE_PATH;
+
+function readJson(file) {
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+function readEnvKeys(file) {
+  if (!fs.existsSync(file)) return {};
+  const text = fs.readFileSync(file, "utf8");
+  const keys = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*(TAVILY_API_KEY_([A-Za-z0-9_]+))=(.*)\s*$/);
+    if (!match) continue;
+    keys[match[2]] = { envVar: match[1] };
+  }
+  return keys;
+}
+
+function normalizeConfig(config) {
+  if (!config || typeof config !== "object") {
+    return { version: 1, activeKey: null, keys: {} };
+  }
+  return {
+    version: typeof config.version === "number" ? config.version : 1,
+    activeKey: config.activeKey ? String(config.activeKey) : null,
+    keys: config.keys && typeof config.keys === "object" ? config.keys : {}
+  };
+}
+
+function ensureConfig() {
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  fs.mkdirSync(path.dirname(keysFile), { recursive: true });
+  if (!fs.existsSync(keysFile)) fs.writeFileSync(keysFile, "", { mode: 0o600 });
+  fs.chmodSync(keysFile, 0o600);
+
+  const config = normalizeConfig(readJson(configFile));
+  const envKeys = readEnvKeys(keysFile);
+  const now = new Date().toISOString();
+  for (const [slot, record] of Object.entries(envKeys)) {
+    if (!config.keys[slot]) {
+      config.keys[slot] = { label: null, envVar: record.envVar, createdAt: now };
+    } else if (!config.keys[slot].envVar) {
+      config.keys[slot].envVar = record.envVar;
+    }
+  }
+
+  if (!config.activeKey) {
+    let legacy = null;
+    if (fs.existsSync(legacyActiveFile)) legacy = fs.readFileSync(legacyActiveFile, "utf8").trim();
+    if (legacy && config.keys[legacy]) config.activeKey = legacy;
+    else config.activeKey = Object.keys(config.keys).sort(slotSort)[0] || null;
+  }
+
+  writeJson(configFile, config);
+  return config;
+}
+
+function slotSort(a, b) {
+  const an = Number(a);
+  const bn = Number(b);
+  if (Number.isInteger(an) && Number.isInteger(bn)) return an - bn;
+  return String(a).localeCompare(String(b));
+}
+
+function resolveRef(config, ref) {
+  if (!ref || ref === "current") return config.activeKey;
+  if (config.keys[ref]) return ref;
+  const matches = Object.entries(config.keys)
+    .filter(([, key]) => key.label === ref)
+    .map(([slot]) => slot);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error(`Alias '${ref}' is ambiguous.`);
+  throw new Error(`Unknown Tavily key: ${ref}`);
+}
+
+function nextSlot(config) {
+  let slot = 1;
+  while (config.keys[String(slot)]) slot += 1;
+  return String(slot);
+}
+
+function envVarForSlot(slot) {
+  return `TAVILY_API_KEY_${String(slot).replace(/[^A-Za-z0-9_]/g, "_").toUpperCase()}`;
+}
+
+function validateAlias(alias, config, currentSlot = null) {
+  if (alias === "" || alias == null) return null;
+  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(alias)) {
+    throw new Error("Alias must start with a letter and contain only letters, numbers, dashes, or underscores.");
+  }
+  for (const [slot, key] of Object.entries(config.keys)) {
+    if (slot !== currentSlot && key.label === alias) {
+      throw new Error(`Alias '${alias}' is already used by #${slot}.`);
+    }
+  }
+  return alias;
+}
+
+function quoteEnv(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function upsertEnv(keyVar, value) {
+  const original = fs.existsSync(keysFile) ? fs.readFileSync(keysFile, "utf8") : "";
+  const lines = original.split(/\r?\n/).filter((line, index, arr) => index < arr.length - 1 || line !== "");
+  const nextLine = `${keyVar}=${quoteEnv(value)}`;
+  let replaced = false;
+  const next = lines.map((line) => {
+    if (line.match(new RegExp(`^\\s*${keyVar}=`))) {
+      replaced = true;
+      return nextLine;
+    }
+    return line;
+  });
+  if (!replaced) next.push(nextLine);
+  fs.writeFileSync(keysFile, `${next.join("\n")}\n`, { mode: 0o600 });
+}
+
+function removeEnv(keyVar) {
+  if (!fs.existsSync(keysFile)) return;
+  const lines = fs.readFileSync(keysFile, "utf8").split(/\r?\n/);
+  const next = lines.filter((line) => !line.match(new RegExp(`^\\s*${keyVar}=`)));
+  fs.writeFileSync(keysFile, next.join("\n").replace(/\n*$/, "\n"), { mode: 0o600 });
+}
+
+try {
+  const config = ensureConfig();
+
+  if (command === "active") {
+    console.log(config.activeKey || "");
+  } else if (command === "resolve") {
+    console.log(resolveRef(config, args[0]));
+  } else if (command === "list") {
+    for (const slot of Object.keys(config.keys).sort(slotSort)) {
+      const key = config.keys[slot];
+      console.log(`${slot}|${key.label || ""}|${key.envVar || envVarForSlot(slot)}`);
+    }
+  } else if (command === "meta") {
+    const slot = resolveRef(config, args[0]);
+    const key = config.keys[slot];
+    console.log(`${slot}|${key.label || ""}|${key.envVar || envVarForSlot(slot)}`);
+  } else if (command === "add") {
+    const value = args[0];
+    const aliasIndex = args.indexOf("--alias");
+    const alias = aliasIndex >= 0 ? args[aliasIndex + 1] : null;
+    if (!value || (aliasIndex >= 0 && !alias)) throw new Error("Usage: tavily-manager add <api-key> [--alias <label>]");
+    const slot = nextSlot(config);
+    const label = validateAlias(alias, config);
+    const envVar = envVarForSlot(slot);
+    config.keys[slot] = { label, envVar, createdAt: new Date().toISOString() };
+    if (!config.activeKey) config.activeKey = slot;
+    upsertEnv(envVar, value);
+    writeJson(configFile, config);
+    console.log(`${slot}|${label || ""}|${envVar}`);
+  } else if (command === "rename") {
+    const slot = resolveRef(config, args[0]);
+    const label = validateAlias(args[1], config, slot);
+    if (!label) throw new Error("Usage: tavily-manager key rename <slot|alias> <alias>");
+    config.keys[slot].label = label;
+    writeJson(configFile, config);
+    console.log(`${slot}|${label}|${config.keys[slot].envVar}`);
+  } else if (command === "remove") {
+    const slot = resolveRef(config, args[0]);
+    const key = config.keys[slot];
+    delete config.keys[slot];
+    if (config.activeKey === slot) config.activeKey = Object.keys(config.keys).sort(slotSort)[0] || null;
+    removeEnv(key.envVar || envVarForSlot(slot));
+    writeJson(configFile, config);
+    console.log(`${slot}|${key.label || ""}|${config.activeKey || ""}`);
+  } else if (command === "switch") {
+    const slot = resolveRef(config, args[0]);
+    config.activeKey = slot;
+    writeJson(configFile, config);
+    const key = config.keys[slot];
+    console.log(`${slot}|${key.label || ""}|${key.envVar || envVarForSlot(slot)}`);
+  } else {
+    throw new Error(`Unknown store command: ${command}`);
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+NODE
+}
+
+store() {
+  TAVILY_CONFIG_FILE_PATH="$config_file" \
+  TAVILY_KEYS_FILE_PATH="$keys_file" \
+  TAVILY_LEGACY_ACTIVE_FILE_PATH="$legacy_active_file" \
+  store_node "$@"
+}
+
+load_store() {
+  store active >/dev/null
+  # shellcheck disable=SC1090
+  source "$keys_file"
+}
+
+resolve_key_ref() {
+  store resolve "$1"
+}
+
+current_id() {
+  store active
+}
+
+key_meta() {
+  store meta "$1"
+}
+
+key_env_for_id() {
+  local meta slot label env_var
+  meta="$(key_meta "$1")"
+  IFS='|' read -r slot label env_var <<<"$meta"
+  printf '%s' "$env_var"
+}
+
+key_label_for_id() {
+  local meta slot label env_var
+  meta="$(key_meta "$1")"
+  IFS='|' read -r slot label env_var <<<"$meta"
+  printf '%s' "$label"
+}
+
+key_title() {
+  local id="$1"
+  local label="$2"
+  if [[ -n "$label" ]]; then
+    printf '#%s %s' "$id" "$label"
+  else
+    printf '#%s' "$id"
+  fi
+}
+
+print_store_paths() {
+  printf '\n'
+  section_title "Storage"
+  ui_kv "secrets" "$keys_file"
+  ui_kv "config" "$config_file"
+}
+
+key_for_id() {
+  local id="$1"
+  local env_var
+  env_var="$(key_env_for_id "$id")"
+  printf '%s' "${!env_var:-}"
+}
+
+status_label() {
+  local percent="$1"
+  local warning="$2"
+
+  if [[ "$percent" == "n/a" ]]; then
+    printf '%s' "n/a"
+  elif awk "BEGIN { exit !($percent <= $warning) }"; then
+    printf '%sLOW%s' "$red" "$reset"
+  elif awk "BEGIN { exit !($percent <= 20) }"; then
+    printf '%sWATCH%s' "$yellow" "$reset"
+  else
+    printf '%sOK%s' "$green" "$reset"
+  fi
+}
+
+status_text() {
+  local percent="$1"
+  local warning="$2"
+
+  if [[ "$percent" == "n/a" ]]; then
+    printf '%s' "n/a"
+  elif awk "BEGIN { exit !($percent <= $warning) }"; then
+    printf '%s' "LOW"
+  elif awk "BEGIN { exit !($percent <= 20) }"; then
+    printf '%s' "WATCH"
+  else
+    printf '%s' "OK"
+  fi
+}
+
+bar() {
+  local percent="$1"
+  local width="${2:-18}"
+
+  if [[ "$percent" == "n/a" ]]; then
+    printf '%*s' "$width" "" | tr ' ' '-'
+    return
+  fi
+
+  local filled
+  filled="$(awk -v pct="$percent" -v width="$width" 'BEGIN { printf "%d", (pct * width / 100) }')"
+  if (( filled < 0 )); then filled=0; fi
+  if (( filled > width )); then filled="$width"; fi
+
+  local empty=$((width - filled))
+  printf '%*s' "$filled" "" | tr ' ' '#'
+  printf '%*s' "$empty" "" | tr ' ' '.'
+}
+
+add_key() {
+  local raw
+  raw="$(store add "$@")"
+  load_store
+
+  local id label env_var key
+  IFS='|' read -r id label env_var <<<"$raw"
+  key="${!env_var:-}"
+
+  headline
+  ui_status "saved" "$(key_title "$id" "$label")"
+  ui_kv "api key" "$(mask_key "$key")"
+  print_store_paths
+}
+
+rename_key() {
+  local raw id label env_var
+  raw="$(store rename "$@")"
+  IFS='|' read -r id label env_var <<<"$raw"
+  headline
+  ui_status "renamed" "$(key_title "$id" "$label")"
+}
+
+remove_key() {
+  local raw id label next
+  raw="$(store remove "$@")"
+  IFS='|' read -r id label next <<<"$raw"
+  headline
+  ui_status "removed" "#$id" "$yellow"
+  if [[ -n "$next" ]]; then
+    ui_kv "active" "#$next"
+  fi
+  print_store_paths
+}
+
+switch_key() {
+  local raw id label env_var key
+  raw="$(store switch "$1")"
+  load_store
+  IFS='|' read -r id label env_var <<<"$raw"
+  key="${!env_var:-}"
+  headline
+  ui_status "active" "$(key_title "$id" "$label")"
+  ui_kv "api key" "$(mask_key "$key")"
+  print_store_paths
+}
+
+usage_for_key() {
+  local id="$1"
+  local env_var key label
+  env_var="$(key_env_for_id "$id")"
+  label="$(key_label_for_id "$id")"
+  key="${!env_var:-}"
+
+  if [[ -z "$key" ]]; then
+    echo "$id: missing key" >&2
+    return 1
+  fi
+
+  local curl_args=(
+    --fail
+    --silent
+    --show-error
+    --request GET
+    --url "https://api.tavily.com/usage"
+    --header "Authorization: Bearer ${key}"
+  )
+
+  if [[ -n "${TAVILY_PROJECT_ID:-}" ]]; then
+    curl_args+=(--header "X-Project-ID: ${TAVILY_PROJECT_ID}")
+  fi
+
+  local response
+  if ! response="$(curl "${curl_args[@]}")"; then
+    echo "$id: failed to fetch usage" >&2
+    return 1
+  fi
+
+  TAVILY_USAGE_RESPONSE="$response" node -e '
+const data = JSON.parse(process.env.TAVILY_USAGE_RESPONSE || "{}");
+const id = process.argv[1];
+const label = process.argv[2];
+const maskedKey = process.argv[3];
+const warningPercent = Number(process.argv[4] || 5);
+
+function number(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function nullableNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function remainingPercent(used, limit) {
+  if (!limit) return null;
+  return Math.max(0, ((limit - used) / limit) * 100);
+}
+
+function rawPercent(value) {
+  return value === null ? "n/a" : value.toFixed(1);
+}
+
+function recordFor(scope, used, limit) {
+  if (limit === null) {
+    return { scope, used, limit: "n/a", remaining: "n/a", percent: "n/a", warning: false };
+  }
+  const remaining = Math.max(0, limit - used);
+  const percent = remainingPercent(used, limit);
+  return {
+    scope,
+    used,
+    limit,
+    remaining,
+    percent: rawPercent(percent),
+    warning: percent !== null && percent <= warningPercent
+  };
+}
+
+const key = data.key || {};
+const account = data.account || {};
+const keyUsed = number(key.usage);
+const keyLimit = nullableNumber(key.limit);
+const planUsed = number(account.plan_usage);
+const planLimit = number(account.plan_limit);
+const paygoUsed = number(account.paygo_usage);
+const paygoLimit = number(account.paygo_limit);
+const accountUsed = planUsed + paygoUsed;
+const accountLimit = planLimit + paygoLimit;
+
+const keyTotal = recordFor("key", keyUsed, keyLimit);
+const accountTotal = recordFor("account", accountUsed, accountLimit);
+const rows = [
+  `META|${id}|${label}|${maskedKey}|${account.current_plan || "unknown"}|${warningPercent}`,
+  `ROW|${keyTotal.scope}|${keyTotal.used}|${keyTotal.limit}|${keyTotal.remaining}|${keyTotal.percent}|${keyTotal.warning ? "1" : "0"}`,
+  `BREAKDOWN|key|${number(key.search_usage)}|${number(key.extract_usage)}|${number(key.crawl_usage)}|${number(key.map_usage)}|${number(key.research_usage)}`
+];
+
+if (accountLimit || account.current_plan) {
+  rows.push(
+    `ROW|${accountTotal.scope}|${accountTotal.used}|${accountTotal.limit}|${accountTotal.remaining}|${accountTotal.percent}|${accountTotal.warning ? "1" : "0"}`,
+    `BREAKDOWN|account|${number(account.search_usage)}|${number(account.extract_usage)}|${number(account.crawl_usage)}|${number(account.map_usage)}|${number(account.research_usage)}`
+  );
+}
+
+console.log(rows.join("\n"));
+' "$id" "$label" "$(mask_key "$key")" "${TAVILY_USAGE_WARNING_PERCENT:-5}"
+}
+
+render_usage() {
+  local raw="$1"
+  local show_headline="${2:-1}"
+  local warning_percent="${TAVILY_USAGE_WARNING_PERCENT:-5}"
+  local key_id=""
+  local label=""
+  local masked=""
+  local plan=""
+  local rows=()
+  local breakdowns=()
+  local line
+
+  while IFS= read -r line; do
+    IFS='|' read -r type c1 c2 c3 c4 c5 c6 _ <<<"$line"
+    case "$type" in
+      META)
+        key_id="$c1"
+        label="$c2"
+        masked="$c3"
+        plan="$c4"
+        warning_percent="$c5"
+        ;;
+      ROW)
+        rows+=("$c1|$c2|$c3|$c4|$c5|$c6")
+        ;;
+      BREAKDOWN)
+        breakdowns+=("$c1|$c2|$c3|$c4|$c5|$c6")
+        ;;
+    esac
+  done <<<"$raw"
+
+  if [[ "$show_headline" == "1" ]]; then
+    headline
+  fi
+
+  section_title "$(key_title "$key_id" "$label")"
+  ui_kv "api key" "$masked"
+  ui_kv "plan" "$plan"
+  ui_kv "warn at" "<= ${warning_percent}% remaining"
+  printf '\n'
+
+  printf '%-10s %9s %9s %9s %9s %-20s %s\n' "Scope" "Used" "Limit" "Remain" "Left" "Credits" "Status"
+  printf '%-10s %9s %9s %9s %9s %-20s %s\n' "----------" "---------" "---------" "---------" "---------" "------------------" "------"
+
+  local row scope used limit remaining percent warn status percent_text
+  for row in "${rows[@]}"; do
+    IFS='|' read -r scope used limit remaining percent warn <<<"$row"
+    status="$(status_label "$percent" "$warning_percent")"
+    if [[ "$percent" == "n/a" ]]; then
+      percent_text="n/a"
+    else
+      percent_text="${percent}%"
+    fi
+    printf '%-10s %9s %9s %9s %9s [%s] %b\n' "$scope" "$used" "$limit" "$remaining" "$percent_text" "$(bar "$percent")" "$status"
+  done
+
+  printf '\n'
+  section_title "Breakdown"
+  printf '%-10s %9s %9s %9s %9s %9s\n' "Scope" "Search" "Extract" "Crawl" "Map" "Research"
+  printf '%-10s %9s %9s %9s %9s %9s\n' "----------" "---------" "---------" "---------" "---------" "---------"
+
+  local breakdown search extract crawl map research
+  for breakdown in "${breakdowns[@]}"; do
+    IFS='|' read -r scope search extract crawl map research <<<"$breakdown"
+    printf '%-10s %9s %9s %9s %9s %9s\n' "$scope" "$search" "$extract" "$crawl" "$map" "$research"
+  done
+}
+
+candidate_for_raw_usage() {
+  local raw="$1"
+  local key_id=""
+  local label=""
+  local masked=""
+  local key_row=""
+  local account_row=""
+  local line
+
+  while IFS= read -r line; do
+    IFS='|' read -r type c1 c2 c3 c4 c5 c6 _ <<<"$line"
+    case "$type" in
+      META)
+        key_id="$c1"
+        label="$c2"
+        masked="$c3"
+        ;;
+      ROW)
+        if [[ "$c1" == "key" ]]; then
+          key_row="$c1|$c2|$c3|$c4|$c5"
+        elif [[ "$c1" == "account" ]]; then
+          account_row="$c1|$c2|$c3|$c4|$c5"
+        fi
+        ;;
+    esac
+  done <<<"$raw"
+
+  local selected="$key_row"
+  if [[ -z "$selected" || "$selected" == *"|n/a" ]]; then
+    selected="$account_row"
+  fi
+
+  if [[ -z "$selected" ]]; then
+    return 1
+  fi
+
+  local scope used limit remaining percent
+  IFS='|' read -r scope used limit remaining percent <<<"$selected"
+  if [[ "$percent" == "n/a" ]]; then
+    return 1
+  fi
+
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$key_id" "$percent" "$scope" "$used" "$limit" "$remaining" "$masked" "$label"
+}
+
+usage_summary_row() {
+  local raw="$1"
+  local candidate
+  candidate="$(candidate_for_raw_usage "$raw")" || return 1
+
+  local key_id percent scope used limit remaining masked label status percent_text
+  IFS='|' read -r key_id percent scope used limit remaining masked label <<<"$candidate"
+  status="$(status_text "$percent" "${TAVILY_USAGE_WARNING_PERCENT:-5}")"
+  percent_text="${percent}%"
+  printf '%-16s %-9s %8s %8s %8s %8s %b\n' "$(key_title "$key_id" "$label")" "$scope" "$used" "$limit" "$remaining" "$percent_text" "$status"
+}
+
+rotate_key() {
+  local dry_run=0
+  local min_remaining="${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}"
+  local only_if_current_below=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --min-remaining)
+        min_remaining="${2:-}"
+        if [[ -z "$min_remaining" ]]; then
+          usage
+          exit 2
+        fi
+        shift 2
+        ;;
+      --only-if-current-below)
+        only_if_current_below="${2:-}"
+        if [[ -z "$only_if_current_below" ]]; then
+          usage
+          exit 2
+        fi
+        shift 2
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
+  done
+
+  local current
+  current="$(current_id)"
+  local best=""
+  local current_candidate=""
+  local candidates=()
+  local id raw candidate percent
+
+  while IFS='|' read -r id _ _; do
+    if [[ -z "$(key_for_id "$id")" ]]; then
+      continue
+    fi
+    if raw="$(usage_for_key "$id" 2>/dev/null)" && candidate="$(candidate_for_raw_usage "$raw")"; then
+      candidates+=("$candidate")
+      if [[ "$id" == "$current" ]]; then
+        current_candidate="$candidate"
+      fi
+      IFS='|' read -r _ percent _ <<<"$candidate"
+      if [[ -z "$best" ]]; then
+        best="$candidate"
+      else
+        local best_percent
+        IFS='|' read -r _ best_percent _ <<<"$best"
+        if awk "BEGIN { exit !($percent > $best_percent) }"; then
+          best="$candidate"
+        fi
+      fi
+    fi
+  done < <(store list)
+
+  if [[ -z "$best" ]]; then
+    echo "No usable Tavily keys found for rotation." >&2
+    exit 1
+  fi
+
+  local best_id best_percent best_scope best_used best_limit best_remaining best_masked best_label
+  IFS='|' read -r best_id best_percent best_scope best_used best_limit best_remaining best_masked best_label <<<"$best"
+
+  if [[ -n "$only_if_current_below" && -n "$current_candidate" ]]; then
+    local current_percent
+    IFS='|' read -r _ current_percent _ <<<"$current_candidate"
+    if awk "BEGIN { exit !($current_percent >= $only_if_current_below) }"; then
+      headline
+      ui_status "skipped" "active key #$current is above threshold" "$yellow"
+      ui_kv "remaining" "${current_percent}%"
+      ui_kv "threshold" "${only_if_current_below}%"
+      exit 0
+    fi
+  fi
+
+  headline
+  if [[ "$dry_run" == "1" ]]; then
+    ui_status "dry run" "#$current -> $(key_title "$best_id" "$best_label")" "$yellow"
+  else
+    if awk "BEGIN { exit !($best_percent < $min_remaining) }"; then
+      ui_status "skipped" "best key below minimum" "$yellow"
+      ui_kv "best key" "$(key_title "$best_id" "$best_label")"
+      ui_kv "remaining" "${best_percent}%"
+      ui_kv "minimum" "${min_remaining}%"
+      exit 1
+    fi
+    store switch "$best_id" >/dev/null
+    ui_status "active" "$(key_title "$best_id" "$best_label")"
+    ui_kv "api key" "$best_masked"
+  fi
+
+  ui_kv "strategy" "most-remaining"
+  ui_kv "scope" "$best_scope"
+  ui_kv "remaining" "$best_remaining/$best_limit (${best_percent}%)"
+  ui_kv "minimum" "${min_remaining}%"
+  printf '\n'
+  section_title "Candidates"
+  printf '%-16s %-9s %-10s %-9s %-9s %s\n' "Key" "Left" "Scope" "Used" "Limit" "API key"
+  printf '%-16s %-9s %-10s %-9s %-9s %s\n' "--------------" "---------" "----------" "---------" "---------" "------------------------"
+
+  local row row_id row_percent row_scope row_used row_limit row_remaining row_masked row_label marker
+  for row in "${candidates[@]}"; do
+    IFS='|' read -r row_id row_percent row_scope row_used row_limit row_remaining row_masked row_label <<<"$row"
+    marker="$(key_title "$row_id" "$row_label")"
+    [[ "$row_id" == "$best_id" ]] && marker=">${marker}"
+    printf '%-16s %-9s %-10s %-9s %-9s %s\n' "$marker" "${row_percent}%" "$row_scope" "$row_used" "$row_limit" "$row_masked"
+  done
+}
+
+list_keys() {
+  load_store
+  local current id label env_var key marker alias
+  current="$(current_id)"
+  headline
+  section_title "Keys"
+  printf '%-5s %-8s %-18s %s\n' "Use" "Slot" "Alias" "API key"
+  printf '%-5s %-8s %-18s %s\n' "-----" "--------" "------------------" "----------------------------"
+  while IFS='|' read -r id label env_var; do
+    key="${!env_var:-}"
+    marker=""
+    [[ "$id" == "$current" ]] && marker="${green}yes${reset}"
+    alias="${label:--}"
+    if [[ -z "$key" ]]; then
+      printf '%-5b %-8s %-18s %b\n' "$marker" "#$id" "$alias" "${red}missing${reset}"
+    else
+      printf '%-5b %-8s %-18s %s\n' "$marker" "#$id" "$alias" "$(mask_key "$key")"
+    fi
+  done < <(store list)
+  print_store_paths
+}
+
+show_current() {
+  load_store
+  local id label env_var key
+  id="$(current_id)"
+  if [[ -z "$id" ]]; then
+    headline
+    ui_empty "No active Tavily key."
+    return
+  fi
+  IFS='|' read -r id label env_var <<<"$(key_meta "$id")"
+  key="${!env_var:-}"
+  headline
+  if [[ -z "$key" ]]; then
+    ui_status "active" "$(key_title "$id" "$label")"
+    ui_kv "api key" "${red}missing${reset}"
+  else
+    ui_status "active" "$(key_title "$id" "$label")"
+    ui_kv "api key" "$(mask_key "$key")"
+  fi
+  print_store_paths
+}
+
+init_store() {
+  store active >/dev/null
+  headline
+  ui_status "ready" "Tavily manager storage initialized"
+  print_store_paths
+  printf '\n'
+  ui_kv "next" "tavily-manager add tvly-..."
+}
+
+file_mode() {
+  local file="$1"
+  if stat -f '%Lp' "$file" >/dev/null 2>&1; then
+    stat -f '%Lp' "$file"
+  else
+    stat -c '%a' "$file"
+  fi
+}
+
+doctor_ok=0
+doctor_warn=0
+doctor_fail=0
+
+doctor_pass() {
+  doctor_ok=$((doctor_ok + 1))
+  printf '  %s%-6s%s %s\n' "$green" "OK" "$reset" "$1"
+}
+
+doctor_note() {
+  doctor_warn=$((doctor_warn + 1))
+  printf '  %s%-6s%s %s\n' "$yellow" "WARN" "$reset" "$1"
+}
+
+doctor_error() {
+  doctor_fail=$((doctor_fail + 1))
+  printf '  %s%-6s%s %s\n' "$red" "FAIL" "$reset" "$1"
+}
+
+active_meta_from_config() {
+  TAVILY_CONFIG_FILE_PATH="$config_file" node -e '
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.env.TAVILY_CONFIG_FILE_PATH, "utf8"));
+const activeKey = config.activeKey;
+const record = activeKey && config.keys ? config.keys[activeKey] : null;
+if (!record || !record.envVar) process.exit(1);
+console.log(`${activeKey}|${record.label || ""}|${record.envVar}`);
+'
+}
+
+doctor() {
+  headline
+  print_store_paths
+  printf '\n'
+  section_title "Checks"
+
+  if [[ -d "$tavily_home" ]]; then
+    doctor_pass "home directory exists: $tavily_home"
+  else
+    doctor_error "home directory is missing: $tavily_home"
+  fi
+
+  if [[ -f "$keys_file" ]]; then
+    doctor_pass "secrets file exists"
+    mode="$(file_mode "$keys_file")"
+    if [[ "$mode" == "600" ]]; then
+      doctor_pass "secrets file permission is 600"
+    else
+      doctor_note "secrets file permission is $mode, recommended 600"
+    fi
+  else
+    doctor_error "secrets file is missing"
+  fi
+
+  if [[ -f "$config_file" ]]; then
+    doctor_pass "config file exists"
+    mode="$(file_mode "$config_file")"
+    if [[ "$mode" == "600" ]]; then
+      doctor_pass "config file permission is 600"
+    else
+      doctor_note "config file permission is $mode, recommended 600"
+    fi
+  else
+    doctor_error "config file is missing"
+  fi
+
+  local tool
+  for tool in node npm npx curl; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      doctor_pass "$tool is available: $(command -v "$tool")"
+    else
+      doctor_error "$tool is not available"
+    fi
+  done
+
+  if command -v tavily-mcp-manager >/dev/null 2>&1; then
+    doctor_pass "tavily-mcp-manager is linked: $(command -v tavily-mcp-manager)"
+  else
+    doctor_note "tavily-mcp-manager is not on PATH; run npm link or use the direct dist/mcp-wrapper.js path in Codex config"
+  fi
+
+  local active_meta active_id active_label active_env_var active_key
+  if [[ -f "$config_file" ]] && active_meta="$(active_meta_from_config 2>/dev/null)"; then
+    IFS='|' read -r active_id active_label active_env_var <<<"$active_meta"
+    doctor_pass "active key is configured: $(key_title "$active_id" "$active_label")"
+    if [[ -f "$keys_file" ]]; then
+      # shellcheck disable=SC1090
+      source "$keys_file"
+      active_key="${!active_env_var:-}"
+      if [[ -n "$active_key" ]]; then
+        doctor_pass "active secret exists in keys.env as $active_env_var"
+        if curl --fail --silent --show-error \
+          --request GET \
+          --url "https://api.tavily.com/usage" \
+          --header "Authorization: Bearer ${active_key}" >/dev/null 2>&1; then
+          doctor_pass "Tavily usage API accepts the active key"
+        else
+          doctor_error "Tavily usage API rejected or could not verify the active key"
+        fi
+      else
+        doctor_error "active secret is missing in keys.env: $active_env_var"
+      fi
+    fi
+  else
+    doctor_error "active key is not configured"
+  fi
+
+  printf '\n'
+  section_title "Summary"
+  ui_kv "ok" "$doctor_ok"
+  ui_kv "warnings" "$doctor_warn"
+  ui_kv "failures" "$doctor_fail"
+  if (( doctor_fail > 0 )); then
+    exit 1
+  fi
+}
+
+mcp_command_for_codex() {
+  if command -v tavily-mcp-manager >/dev/null 2>&1; then
+    printf '%s' "tavily-mcp-manager"
+  elif [[ -x "$repo_root/dist/mcp-wrapper.js" ]]; then
+    printf '%s' "$repo_root/dist/mcp-wrapper.js"
+  else
+    printf '%s' "$repo_root/src/mcp/tavily-mcp-manager"
+  fi
+}
+
+mcp_config_codex() {
+  local command_path
+  command_path="$(mcp_command_for_codex)"
+  cat <<EOF
+[mcp_servers.tavily]
+command = "$command_path"
+args = []
+EOF
+}
+
+mcp_status() {
+  load_store
+  local id label env_var key
+  id="$(current_id)"
+  IFS='|' read -r id label env_var <<<"$(key_meta "$id")"
+  key="${!env_var:-}"
+
+  headline
+  section_title "MCP Runtime"
+  ui_kv "command" "$(mcp_command_for_codex)"
+  ui_kv "package" "tavily-mcp@latest"
+  if [[ -n "$key" ]]; then
+    ui_kv "active" "$(key_title "$id" "$label")  $(mask_key "$key")"
+  else
+    ui_kv "active" "$(key_title "$id" "$label")  ${red}missing${reset}"
+  fi
+  ui_kv "auto rotate" "${TAVILY_AUTO_ROTATE:-0}"
+  ui_kv "threshold" "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}%"
+  ui_kv "usage check" "${TAVILY_USAGE_STARTUP_CHECK:-1}"
+  ui_kv "npm cache" "${TAVILY_NPM_CACHE:-/tmp/codex-npm-cache}"
+  print_store_paths
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+command="$1"
+shift || true
+
+if [[ "$command" == "key" ]]; then
+  command="${1:-}"
+  shift || true
+fi
+
+case "$command" in
+  init)
+    init_store
+    ;;
+  doctor)
+    doctor
+    ;;
+  mcp)
+    mcp_command="${1:-}"
+    shift || true
+    case "$mcp_command" in
+      status)
+        mcp_status
+        ;;
+      config)
+        case "${1:-}" in
+          codex)
+            mcp_config_codex
+            ;;
+          *)
+            usage
+            exit 2
+            ;;
+        esac
+        ;;
+      *)
+        usage
+        exit 2
+        ;;
+    esac
+    ;;
+  add)
+    add_key "$@"
+    ;;
+  rename)
+    rename_key "$@"
+    ;;
+  remove|rm)
+    remove_key "$@"
+    ;;
+  current)
+    show_current
+    ;;
+  list|ls)
+    list_keys
+    ;;
+  usage|status)
+    load_store
+    target="${1:-current}"
+    case "$target" in
+      current)
+        raw_usage="$(usage_for_key "$(current_id)")"
+        render_usage "$raw_usage"
+        ;;
+      all)
+        headline
+        section_title "Usage Summary"
+        printf '%-16s %-9s %8s %8s %8s %8s %s\n' "Key" "Scope" "Used" "Limit" "Remain" "Left" "Status"
+        printf '%-16s %-9s %8s %8s %8s %8s %s\n' "----------------" "---------" "--------" "--------" "--------" "--------" "------"
+        while IFS='|' read -r id _ _; do
+          if raw_usage="$(usage_for_key "$id" 2>/dev/null)"; then
+            usage_summary_row "$raw_usage" || true
+          fi
+        done < <(store list)
+        print_store_paths
+        ;;
+      *)
+        id="$(resolve_key_ref "$target")"
+        raw_usage="$(usage_for_key "$id")"
+        render_usage "$raw_usage"
+        ;;
+    esac
+    ;;
+  switch)
+    switch_key "${1:-}"
+    ;;
+  rotate)
+    load_store
+    rotate_key "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

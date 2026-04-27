@@ -1,0 +1,11 @@
+.DS_Store
+.idea/
+.env
+.env.*
+keys.env
+active-key
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+*.tgz
