@@ -5,10 +5,13 @@ tavily_home="${TAVILY_HOME:-$HOME/.codex/tavily}"
 keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
 config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
 npm_cache="${TAVILY_NPM_CACHE:-/tmp/codex-npm-cache}"
+tavily_mcp_version="${TAVILY_MCP_VERSION:-0.2.19}"
+tavily_mcp_package="${TAVILY_MCP_PACKAGE:-tavily-mcp@$tavily_mcp_version}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if [[ "${TAVILY_AUTO_ROTATE:-0}" == "1" ]]; then
-  "$repo_root/src/cli/tavily-manager" rotate \
+  TAVILY_USAGE_TIMEOUT_SECONDS="${TAVILY_USAGE_STARTUP_TIMEOUT_SECONDS:-2}" \
+    "$repo_root/src/cli/tavily-manager" rotate \
     --min-remaining "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}" \
     --only-if-current-below "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}" >&2 || true
 else
@@ -50,9 +53,12 @@ fi
 
 export TAVILY_API_KEY="$tavily_api_key"
 export npm_config_cache="$npm_cache"
+export npm_config_audit="${npm_config_audit:-false}"
+export npm_config_fund="${npm_config_fund:-false}"
 
-if [[ "${TAVILY_USAGE_STARTUP_CHECK:-1}" != "0" ]]; then
+if [[ "${TAVILY_USAGE_STARTUP_CHECK:-0}" != "0" ]]; then
   usage_json="$(curl --fail --silent --show-error \
+    --max-time "${TAVILY_USAGE_STARTUP_TIMEOUT_SECONDS:-2}" \
     --request GET \
     --url "https://api.tavily.com/usage" \
     --header "Authorization: Bearer ${TAVILY_API_KEY}" 2>/dev/null || true)"
@@ -85,4 +91,8 @@ if (limit > 0) {
   fi
 fi
 
-exec npx -y tavily-mcp@latest "$@"
+if [[ "${TAVILY_MCP_OFFLINE:-1}" == "1" ]]; then
+  exec npm exec --yes --offline --package "$tavily_mcp_package" -- tavily-mcp "$@"
+fi
+
+exec npm exec --yes --package "$tavily_mcp_package" -- tavily-mcp "$@"

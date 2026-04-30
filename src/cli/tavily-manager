@@ -105,9 +105,20 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function jsonText(value) {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const next = jsonText(value);
+  try {
+    fs.writeFileSync(file, next, { mode: 0o600 });
+  } catch (error) {
+    const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+    if (error.code === "EPERM" && current === next) return;
+    throw error;
+  }
 }
 
 function readEnvKeys(file) {
@@ -137,7 +148,12 @@ function ensureConfig() {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   fs.mkdirSync(path.dirname(keysFile), { recursive: true });
   if (!fs.existsSync(keysFile)) fs.writeFileSync(keysFile, "", { mode: 0o600 });
-  fs.chmodSync(keysFile, 0o600);
+  try {
+    fs.chmodSync(keysFile, 0o600);
+  } catch (error) {
+    const mode = fs.statSync(keysFile).mode & 0o777;
+    if (error.code !== "EPERM" || mode !== 0o600) throw error;
+  }
 
   const config = normalizeConfig(readJson(configFile));
   const envKeys = readEnvKeys(keysFile);
@@ -464,6 +480,7 @@ usage_for_key() {
     --fail
     --silent
     --show-error
+    --max-time "${TAVILY_USAGE_TIMEOUT_SECONDS:-10}"
     --request GET
     --url "https://api.tavily.com/usage"
     --header "Authorization: Bearer ${key}"
@@ -1000,7 +1017,7 @@ mcp_status() {
   headline
   section_title "MCP Runtime"
   ui_kv "command" "$(mcp_command_for_codex)"
-  ui_kv "package" "tavily-mcp@latest"
+  ui_kv "package" "tavily-mcp@${TAVILY_MCP_VERSION:-0.2.19}"
   if [[ -n "$key" ]]; then
     ui_kv "active" "$(key_title "$id" "$label")  $(mask_key "$key")"
   else
@@ -1008,7 +1025,7 @@ mcp_status() {
   fi
   ui_kv "auto rotate" "${TAVILY_AUTO_ROTATE:-0}"
   ui_kv "threshold" "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}%"
-  ui_kv "usage check" "${TAVILY_USAGE_STARTUP_CHECK:-1}"
+  ui_kv "usage check" "${TAVILY_USAGE_STARTUP_CHECK:-0}"
   ui_kv "npm cache" "${TAVILY_NPM_CACHE:-/tmp/codex-npm-cache}"
   print_store_paths
 }
