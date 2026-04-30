@@ -1,6 +1,6 @@
 {
   "name": "tavily-mcp-manager",
-  "version": "0.1.2",
+  "version": "0.1.0",
   "description": "CLI and MCP wrapper for managing switchable Tavily API keys in Codex.",
   "license": "MIT",
   "keywords": [
