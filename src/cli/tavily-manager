@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tavily_home="${TAVILY_HOME:-$HOME/.codex/tavily}"
+tavily_home="${TAVILY_HOME:-$HOME/.tavily-mcp-manager}"
 keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
 config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
 legacy_active_file="${TAVILY_ACTIVE_FILE:-$tavily_home/active-key}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$(dirname "${BASH_SOURCE[0]}")/mcp-config.sh"
 
 usage() {
   {
@@ -29,6 +30,10 @@ usage() {
     printf '    %-30s %s\n' "doctor" "check local setup"
     printf '    %-30s %s\n' "mcp status" "show wrapper runtime status"
     printf '    %-30s %s\n' "mcp config codex" "print Codex TOML config"
+    printf '    %-30s %s\n' "mcp config claude" "print Claude Code JSON config"
+    printf '    %-30s %s\n' "mcp config gemini" "print Gemini CLI JSON config"
+    printf '    %-30s %s\n' "mcp config opencode" "print OpenCode JSON config"
+    printf '    %-30s %s\n' "mcp config list" "show supported agents"
     printf '\n'
     printf '  %s\n' "${dim}Rotate options: --dry-run --min-remaining <percent> --only-if-current-below <percent>${reset}"
   } >&2
@@ -853,6 +858,12 @@ show_current() {
 }
 
 init_store() {
+  local old_path="$HOME/.codex/tavily"
+  if [[ -d "$old_path" && ! -d "$tavily_home" ]]; then
+    mkdir -p "$(dirname "$tavily_home")"
+    mv "$old_path" "$tavily_home"
+    ui_status "migrated" "Moved data from $old_path to $tavily_home"
+  fi
   store active >/dev/null
   headline
   ui_status "ready" "Tavily manager storage initialized"
@@ -987,25 +998,7 @@ doctor() {
   fi
 }
 
-mcp_command_for_codex() {
-  if command -v tavily-mcp-manager >/dev/null 2>&1; then
-    printf '%s' "tavily-mcp-manager"
-  elif [[ -x "$repo_root/dist/mcp-wrapper.js" ]]; then
-    printf '%s' "$repo_root/dist/mcp-wrapper.js"
-  else
-    printf '%s' "$repo_root/src/mcp/tavily-mcp-manager"
-  fi
-}
 
-mcp_config_codex() {
-  local command_path
-  command_path="$(mcp_command_for_codex)"
-  cat <<EOF
-[mcp_servers.tavily]
-command = "$command_path"
-args = []
-EOF
-}
 
 mcp_status() {
   load_store
@@ -1016,7 +1009,7 @@ mcp_status() {
 
   headline
   section_title "MCP Runtime"
-  ui_kv "command" "$(mcp_command_for_codex)"
+  ui_kv "command" "$(mcp_command_path)"
   ui_kv "package" "tavily-mcp@${TAVILY_MCP_VERSION:-0.2.19}"
   if [[ -n "$key" ]]; then
     ui_kv "active" "$(key_title "$id" "$label")  $(mask_key "$key")"
@@ -1026,7 +1019,7 @@ mcp_status() {
   ui_kv "auto rotate" "${TAVILY_AUTO_ROTATE:-0}"
   ui_kv "threshold" "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}%"
   ui_kv "usage check" "${TAVILY_USAGE_STARTUP_CHECK:-0}"
-  ui_kv "npm cache" "${TAVILY_NPM_CACHE:-/tmp/codex-npm-cache}"
+  ui_kv "npm cache" "${TAVILY_NPM_CACHE:-/tmp/tavily-mcp-npm-cache}"
   print_store_paths
 }
 
@@ -1061,6 +1054,18 @@ case "$command" in
         case "${1:-}" in
           codex)
             mcp_config_codex
+            ;;
+          claude)
+            mcp_config_claude
+            ;;
+          gemini)
+            mcp_config_gemini
+            ;;
+          opencode)
+            mcp_config_opencode
+            ;;
+          list)
+            mcp_config_list
             ;;
           *)
             usage

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tavily_home="${TAVILY_HOME:-$HOME/.codex/tavily}"
+tavily_home="${TAVILY_HOME:-$HOME/.tavily-mcp-manager}"
 keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
 config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
-npm_cache="${TAVILY_NPM_CACHE:-/tmp/codex-npm-cache}"
+npm_cache="${TAVILY_NPM_CACHE:-/tmp/tavily-mcp-npm-cache}"
 tavily_mcp_version="${TAVILY_MCP_VERSION:-0.2.19}"
 tavily_mcp_package="${TAVILY_MCP_PACKAGE:-tavily-mcp@$tavily_mcp_version}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

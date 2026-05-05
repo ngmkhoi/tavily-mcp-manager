@@ -2,11 +2,17 @@
 
 Last updated: 2026-04-28
 
-Tavily MCP Manager is a small global CLI for running `tavily-mcp` in Codex with switchable Tavily API keys. It gives you one command for key management and one command that Codex can use as the MCP server entrypoint.
+Tavily MCP Manager is a small global CLI for running `tavily-mcp` with switchable Tavily API keys. It gives you one command for key management and one command that AI coding agents can use as the MCP server entrypoint.
 
 ## What It Solves
 
-Codex needs a stable MCP command, but Tavily keys can run low, rotate between accounts, or need local isolation. This package keeps Tavily secrets outside your project, tracks the active key, checks usage, and starts `tavily-mcp@latest` with the selected key.
+AI coding agents need a stable MCP command, but Tavily keys can run low, rotate between accounts, or need local isolation. This package keeps Tavily secrets outside your project, tracks the active key, checks usage, and starts `tavily-mcp@latest` with the selected key.
+
+Supported agents:
+- OpenAI Codex
+- Claude Code
+- Gemini CLI
+- OpenCode
 
 It ships two executables:
 
@@ -40,10 +46,14 @@ tavily-manager add tvly-... --alias personal
 tavily-manager doctor
 ```
 
-Print the Codex MCP config block:
+Print the MCP config for your agent:
 
 ```bash
-tavily-manager mcp config codex
+tavily-manager mcp config list      # show supported agents
+tavily-manager mcp config codex     # Codex TOML format
+tavily-manager mcp config claude    # Claude Code JSON format
+tavily-manager mcp config gemini    # Gemini CLI JSON format
+tavily-manager mcp config opencode  # OpenCode JSON format
 ```
 
 Add that block to your global Codex config:
@@ -108,17 +118,70 @@ Diagnostics and MCP output:
 ```bash
 tavily-manager doctor
 tavily-manager mcp status
+tavily-manager mcp config list
 tavily-manager mcp config codex
+tavily-manager mcp config claude
+tavily-manager mcp config gemini
+tavily-manager mcp config opencode
 ```
 
-## Codex MCP Setup
+## Multi-Agent MCP Setup
 
-The recommended Codex config uses the global package command:
+The CLI can generate MCP config for multiple AI coding agents.
+
+### Codex
 
 ```toml
 [mcp_servers.tavily]
 command = "tavily-mcp-manager"
 args = []
+```
+
+### Claude Code
+
+Add to `~/.claude.json` or `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "tavily": {
+      "command": "tavily-mcp-manager",
+      "args": []
+    }
+  }
+}
+```
+
+### Gemini CLI
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "tavily": {
+      "command": "tavily-mcp-manager",
+      "args": []
+    }
+  }
+}
+```
+
+### OpenCode
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "tavily": {
+      "type": "local",
+      "command": ["tavily-mcp-manager"],
+      "enabled": true,
+      "environment": {}
+    }
+  }
+}
 ```
 
 At startup, `tavily-mcp-manager` reads the active key from the manager config, exports it as `TAVILY_API_KEY`, optionally checks remaining usage, then runs:
@@ -137,11 +200,11 @@ When auto-rotation is enabled, the wrapper switches away from the active key onl
 
 ## Config Paths
 
-By default, state lives under `~/.codex/tavily`:
+By default, state lives under `~/.tavily-mcp-manager`:
 
 ```text
-~/.codex/tavily/keys.env      # Tavily API key values
-~/.codex/tavily/config.json   # active key, aliases, and metadata
+~/.tavily-mcp-manager/keys.env      # Tavily API key values
+~/.tavily-mcp-manager/config.json   # active key, aliases, and metadata
 ```
 
 Secret file example:
@@ -174,10 +237,10 @@ Metadata example:
 
 Optional environment overrides:
 
-- `TAVILY_HOME`: manager home path, default `~/.codex/tavily`.
+- `TAVILY_HOME`: manager home path, default `~/.tavily-mcp-manager`.
 - `TAVILY_CONFIG_FILE`: metadata config path.
 - `TAVILY_KEYS_FILE`: secret key file path.
-- `TAVILY_NPM_CACHE`: npm cache path for the MCP wrapper, default `/tmp/codex-npm-cache`.
+- `TAVILY_NPM_CACHE`: npm cache path for the MCP wrapper, default `/tmp/tavily-mcp-npm-cache`.
 - `TAVILY_USAGE_WARNING_PERCENT`: low-credit warning threshold, default `5`.
 - `TAVILY_USAGE_STARTUP_CHECK`: set to `0` to skip startup usage checks.
 - `TAVILY_AUTO_ROTATE`: set to `1` to rotate before MCP startup.
@@ -186,13 +249,13 @@ Optional environment overrides:
 
 ## Security Model
 
-API keys are not stored in this repository. The CLI writes secrets to `~/.codex/tavily/keys.env` and metadata to `~/.codex/tavily/config.json`.
+API keys are not stored in this repository. The CLI writes secrets to `~/.tavily-mcp-manager/keys.env` and metadata to `~/.tavily-mcp-manager/config.json`.
 
 Recommended permissions:
 
 ```bash
-chmod 700 ~/.codex/tavily
-chmod 600 ~/.codex/tavily/keys.env ~/.codex/tavily/config.json
+chmod 700 ~/.tavily-mcp-manager
+chmod 600 ~/.tavily-mcp-manager/keys.env ~/.tavily-mcp-manager/config.json
 ```
 
 The MCP wrapper exports only the selected key as `TAVILY_API_KEY` for the child `tavily-mcp@latest` process. It does not print full keys. CLI output masks key values when displaying active or listed keys.
@@ -227,8 +290,8 @@ npm i -g tavily-mcp-manager
 tavily-manager init
 tavily-manager add tvly-...
 tavily-manager switch <slot|alias>
-chmod 700 ~/.codex/tavily
-chmod 600 ~/.codex/tavily/keys.env ~/.codex/tavily/config.json
+chmod 700 ~/.tavily-mcp-manager
+chmod 600 ~/.tavily-mcp-manager/keys.env ~/.tavily-mcp-manager/config.json
 ```
 
 If Codex cannot find the MCP command, use the direct path shown by:
