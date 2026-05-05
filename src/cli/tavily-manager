@@ -252,6 +252,17 @@ function upsertEnv(keyVar, value) {
   fs.writeFileSync(keysFile, `${next.join("\n")}\n`, { mode: 0o600 });
 }
 
+function readEnvValues() {
+  if (!fs.existsSync(keysFile)) return [];
+  const lines = fs.readFileSync(keysFile, "utf8").split(/\r?\n/);
+  const values = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*\w+=("(.*)"|(.*))$/);
+    if (m) values.push(m[2] !== undefined ? m[2].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : m[3]);
+  }
+  return values;
+}
+
 function removeEnv(keyVar) {
   if (!fs.existsSync(keysFile)) return;
   const lines = fs.readFileSync(keysFile, "utf8").split(/\r?\n/);
@@ -280,6 +291,8 @@ try {
     const aliasIndex = args.indexOf("--alias");
     const alias = aliasIndex >= 0 ? args[aliasIndex + 1] : null;
     if (!value || (aliasIndex >= 0 && !alias)) throw new Error("Usage: tavily-manager add <api-key> [--alias <label>]");
+    const existing = readEnvValues();
+    if (existing.includes(value)) throw new Error("This API key is already stored.");
     const slot = nextSlot(config);
     const label = validateAlias(alias, config);
     const envVar = envVarForSlot(slot);
