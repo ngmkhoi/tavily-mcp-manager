@@ -1,13 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve symlink to find real script directory
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
 tavily_home="${TAVILY_HOME:-$HOME/.tavily-mcp-manager}"
 keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
 config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
 npm_cache="${TAVILY_NPM_CACHE:-/tmp/tavily-mcp-npm-cache}"
 tavily_mcp_version="${TAVILY_MCP_VERSION:-0.2.19}"
 tavily_mcp_package="${TAVILY_MCP_PACKAGE:-tavily-mcp@$tavily_mcp_version}"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+mcp_command_path() {
+  if command -v tavily-mcp >/dev/null 2>&1; then
+    printf '%s' "tavily-mcp"
+  elif [[ -x "$npm_cache/node_modules/.bin/tavily-mcp" ]]; then
+    printf '%s' "$npm_cache/node_modules/.bin/tavily-mcp"
+  else
+    printf '%s' ""
+  fi
+}
+
+ensure_mcp_cached() {
+  local cmd
+  cmd="$(mcp_command_path)"
+  if [[ -n "$cmd" ]]; then
+    return 0
+  fi
+
+  echo "[tavily-mcp] First run: installing tavily-mcp@$tavily_mcp_version to $npm_cache ..." >&2
+  mkdir -p "$npm_cache"
+  npm install --prefix "$npm_cache" "$tavily_mcp_package" >/dev/null 2>&1
+}
+
+resolve_and_exec_mcp() {
+  local cmd
+  cmd="$(mcp_command_path)"
+  if [[ -n "$cmd" ]]; then
+    exec "$cmd" "$@"
+  fi
+
+  exec npm exec --yes --package "$tavily_mcp_package" -- tavily-mcp "$@"
+}
 
 if [[ "${TAVILY_AUTO_ROTATE:-0}" == "1" ]]; then
   TAVILY_USAGE_TIMEOUT_SECONDS="${TAVILY_USAGE_STARTUP_TIMEOUT_SECONDS:-2}" \
@@ -91,8 +132,5 @@ if (limit > 0) {
   fi
 fi
 
-if [[ "${TAVILY_MCP_OFFLINE:-1}" == "1" ]]; then
-  exec npm exec --yes --offline --package "$tavily_mcp_package" -- tavily-mcp "$@"
-fi
-
-exec npm exec --yes --package "$tavily_mcp_package" -- tavily-mcp "$@"
+ensure_mcp_cached
+resolve_and_exec_mcp "$@"
