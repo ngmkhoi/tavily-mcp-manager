@@ -24,7 +24,23 @@ tavily-manager add tvly-... --alias personal
 tavily-manager doctor
 ```
 
-Print MCP config for your agent:
+Register the server with your agent:
+
+```bash
+tavily-manager mcp install claude     # or codex / gemini / opencode
+tavily-manager mcp install all        # every agent found on this machine
+tavily-manager mcp install claude --dry-run   # show what would change
+tavily-manager mcp install claude --force     # replace an existing entry
+```
+
+This writes the config for you, with `TAVILY_AUTO_ROTATE=1` already set. Where
+the agent ships its own CLI (`claude`, `codex`, `gemini`) that CLI is used, so
+the agent stays the authority on its own config format; otherwise the config
+file is patched directly, leaving every unrelated key alone and keeping a
+`.bak` copy. Re-running is a no-op, and a config file that does not parse is
+left untouched rather than overwritten.
+
+To copy the config in yourself instead:
 
 ```bash
 tavily-manager mcp config list      # show supported agents
@@ -41,7 +57,8 @@ tavily-manager mcp config opencode  # OpenCode JSON
 | **Key setup** | `init`, `add <key> [--alias]`, `list`, `current`, `switch <slot\|alias>` |
 | **Key maintenance** | `key add`, `key rename`, `key remove` |
 | **Usage & rotation** | `usage [all]`, `rotate [--dry-run]` |
-| **Diagnostics** | `doctor`, `mcp status`, `mcp config <agent>` |
+| **Setup** | `mcp install <agent\|all>`, `mcp config <agent>` |
+| **Diagnostics** | `doctor`, `mcp status` |
 
 ## Multi-Agent MCP Setup
 
@@ -218,4 +235,5 @@ tests/
   test_store.sh   # quoting, migration, CRUD, concurrent writes
   test_cache.sh   # cache integrity and version pinning
   test_rotate.sh  # rotation, shared accounts, usage cache, breakdown
+  test_install.sh # mcp install: config patching, dry run, idempotency
 ```

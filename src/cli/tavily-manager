@@ -48,12 +48,12 @@ usage() {
     printf '  %s\n' "${bold}MCP${reset}"
     printf '    %-30s %s\n' "doctor" "check local setup"
     printf '    %-30s %s\n' "mcp status" "show wrapper runtime status"
-    printf '    %-30s %s\n' "mcp config codex" "print Codex TOML config"
-    printf '    %-30s %s\n' "mcp config claude" "print Claude Code JSON config"
-    printf '    %-30s %s\n' "mcp config gemini" "print Gemini CLI JSON config"
-    printf '    %-30s %s\n' "mcp config opencode" "print OpenCode JSON config"
+    printf '    %-30s %s\n' "mcp install <agent|all>" "register tavily with an agent"
+    printf '    %-30s %s\n' "mcp config <agent>" "print config to paste manually"
     printf '    %-30s %s\n' "mcp config list" "show supported agents"
     printf '\n'
+    printf '  %s\n' "${dim}Agents: codex, claude, gemini, opencode${reset}"
+    printf '  %s\n' "${dim}Install options: --dry-run --force${reset}"
     printf '  %s\n' "${dim}Rotate options: --dry-run --min-remaining <percent> --only-if-current-below <percent>${reset}"
   } >&2
 }
@@ -84,6 +84,9 @@ case "$command" in
     case "$mcp_command" in
       status)
         mcp_status
+        ;;
+      install)
+        mcp_install "$@"
         ;;
       config)
         case "${1:-}" in
