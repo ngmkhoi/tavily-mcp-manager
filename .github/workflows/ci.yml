@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS ships bash 3.2, Linux ships 5.x. The scripts must work on both,
+        # so the suite runs on each rather than on one and hoping.
+        os: [macos-latest, ubuntu-latest]
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Report bash version
+        run: bash --version | head -1
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        # -x follows `source` so the sourced-module layout is analysed as one
+        # program; checking the files individually only yields false positives.
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -x --shell=bash --severity=warning \
+            src/cli/tavily-manager \
+            src/mcp/tavily-mcp-manager \
+            tests/run.sh
