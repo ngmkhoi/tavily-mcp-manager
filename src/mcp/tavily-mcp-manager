@@ -13,45 +13,133 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 tavily_home="${TAVILY_HOME:-$HOME/.tavily-mcp-manager}"
 keys_file="${TAVILY_KEYS_FILE:-$tavily_home/keys.env}"
 config_file="${TAVILY_CONFIG_FILE:-$tavily_home/config.json}"
-npm_cache="${TAVILY_NPM_CACHE:-/tmp/tavily-mcp-npm-cache}"
+legacy_active_file="${TAVILY_ACTIVE_FILE:-$tavily_home/active-key}"
+# Deliberately not under /tmp: macOS prunes files there that have not been
+# accessed for a few days, which silently guts the dependency tree and leaves
+# a cache that looks installed but cannot start.
+npm_cache="${TAVILY_NPM_CACHE:-$tavily_home/npm-cache}"
 tavily_mcp_version="${TAVILY_MCP_VERSION:-0.2.19}"
 tavily_mcp_package="${TAVILY_MCP_PACKAGE:-tavily-mcp@$tavily_mcp_version}"
 repo_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-mcp_command_path() {
-  if command -v tavily-mcp >/dev/null 2>&1; then
-    printf '%s' "tavily-mcp"
-  elif [[ -x "$npm_cache/node_modules/.bin/tavily-mcp" ]]; then
-    printf '%s' "$npm_cache/node_modules/.bin/tavily-mcp"
-  else
-    printf '%s' ""
+cache_bin="$npm_cache/node_modules/.bin/tavily-mcp"
+cache_stamp="$npm_cache/.tavily-mcp-installed"
+
+# legacy_active_file is consumed by store(), defined in the sourced module.
+# shellcheck source=src/cli/store.sh
+source "$SCRIPT_DIR/../cli/store.sh"
+
+# A present .bin symlink proves nothing: it survives even when every package
+# it points into has been pruned. Verify that the package tree is actually
+# intact and that it holds the version we pinned.
+cache_is_healthy() {
+  [[ -x "$cache_bin" ]] || return 1
+  [[ -f "$cache_stamp" ]] || return 1
+  [[ "$(cat "$cache_stamp" 2>/dev/null)" == "$tavily_mcp_package" ]] || return 1
+
+  TAVILY_CACHE_ROOT="$npm_cache" node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const root = path.join(process.env.TAVILY_CACHE_ROOT, "node_modules");
+
+// Every installed package must still have a readable package.json. That file
+// carries the "exports" map, so a package missing it breaks subpath imports
+// with ERR_MODULE_NOT_FOUND even though the directory still exists.
+function check(dir) {
+  for (const entry of fs.readdirSync(dir)) {
+    if (entry.startsWith(".")) continue;
+    const full = path.join(dir, entry);
+    if (entry.startsWith("@")) {
+      if (fs.statSync(full).isDirectory()) check(full);
+      continue;
+    }
+    if (!fs.statSync(full).isDirectory()) continue;
+    if (!fs.existsSync(path.join(full, "package.json"))) {
+      process.exit(1);
+    }
+  }
+}
+
+try {
+  if (!fs.existsSync(root)) process.exit(1);
+  check(root);
+  require.resolve("tavily-mcp/package.json", { paths: [process.env.TAVILY_CACHE_ROOT] });
+} catch {
+  process.exit(1);
+}
+' >/dev/null 2>&1 || return 1
+
+  return 0
+}
+
+install_mcp() {
+  local reason="$1"
+
+  # Guard the rm below: an empty or root cache path must never be walked.
+  if [[ -z "$npm_cache" || "$npm_cache" == "/" ]]; then
+    echo "[tavily-mcp] refusing to use '$npm_cache' as the npm cache path" >&2
+    return 1
   fi
+
+  echo "[tavily-mcp] $reason — installing $tavily_mcp_package into $npm_cache ..." >&2
+  rm -rf "$npm_cache/node_modules" "$cache_stamp"
+  mkdir -p "$npm_cache"
+
+  local log
+  log="$(npm install --prefix "$npm_cache" --no-audit --no-fund "$tavily_mcp_package" 2>&1)" || {
+    echo "[tavily-mcp] install failed:" >&2
+    printf '%s\n' "$log" | tail -20 >&2
+    return 1
+  }
+
+  printf '%s' "$tavily_mcp_package" > "$cache_stamp"
 }
 
 ensure_mcp_cached() {
-  local cmd
-  cmd="$(mcp_command_path)"
-  if [[ -n "$cmd" ]]; then
+  if cache_is_healthy; then
     return 0
   fi
 
-  echo "[tavily-mcp] First run: installing tavily-mcp@$tavily_mcp_version to $npm_cache ..." >&2
-  mkdir -p "$npm_cache"
-  npm install --prefix "$npm_cache" "$tavily_mcp_package" >/dev/null 2>&1
+  local reason="First run"
+  if [[ -e "$cache_bin" ]]; then
+    if [[ -f "$cache_stamp" && "$(cat "$cache_stamp" 2>/dev/null)" != "$tavily_mcp_package" ]]; then
+      reason="Cached $(cat "$cache_stamp" 2>/dev/null) does not match requested $tavily_mcp_package"
+    else
+      reason="Cached install is incomplete or corrupted"
+    fi
+  fi
+
+  install_mcp "$reason"
 }
 
 resolve_and_exec_mcp() {
-  local cmd
-  cmd="$(mcp_command_path)"
-  if [[ -n "$cmd" ]]; then
-    exec "$cmd" "$@"
+  if cache_is_healthy; then
+    exec "$cache_bin" "$@"
   fi
 
+  # Opt-in escape hatch: a globally installed tavily-mcp is not version-checked,
+  # so it is only used when the pinned cache could not be prepared.
+  if [[ "${TAVILY_MCP_ALLOW_GLOBAL:-0}" == "1" ]] && command -v tavily-mcp >/dev/null 2>&1; then
+    echo "[tavily-mcp] WARNING: falling back to the global tavily-mcp on PATH; its version is not verified against $tavily_mcp_package." >&2
+    exec tavily-mcp "$@"
+  fi
+
+  echo "[tavily-mcp] WARNING: no usable cache; falling back to 'npm exec', which downloads on every start." >&2
   exec npm exec --yes --package "$tavily_mcp_package" -- tavily-mcp "$@"
 }
 
+# Internal hook so the test suite can exercise the real verification logic
+# instead of a copy of it that could drift.
+if [[ "${1:-}" == "--verify-cache" ]]; then
+  cache_is_healthy
+  exit $?
+fi
+
 if [[ "${TAVILY_AUTO_ROTATE:-0}" == "1" ]]; then
+  # Startup rotation reads through the usage cache. Explicit `tavily-manager
+  # usage` calls still go to the API, so the numbers a human asks for are live.
   TAVILY_USAGE_TIMEOUT_SECONDS="${TAVILY_USAGE_STARTUP_TIMEOUT_SECONDS:-2}" \
+  TAVILY_USAGE_USE_CACHE="${TAVILY_USAGE_USE_CACHE:-1}" \
     "$repo_root/src/cli/tavily-manager" rotate \
     --min-remaining "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}" \
     --only-if-current-below "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}" >&2 || true
@@ -69,9 +157,6 @@ if [[ ! -r "$config_file" ]]; then
   exit 1
 fi
 
-# shellcheck disable=SC1090
-source "$keys_file"
-
 active_env_var="$(
   TAVILY_CONFIG_FILE_PATH="$config_file" node -e '
 const fs = require("node:fs");
@@ -86,7 +171,9 @@ console.log(record.envVar);
 '
 )"
 
-tavily_api_key="${!active_env_var:-}"
+# Read the secret through the store rather than sourcing keys.env, so a key
+# value can never be interpreted as shell syntax.
+tavily_api_key="$(store get 2>/dev/null || true)"
 if [[ -z "$tavily_api_key" ]]; then
   echo "Tavily key '$active_env_var' is empty or missing in $keys_file" >&2
   exit 1
@@ -132,5 +219,5 @@ if (limit > 0) {
   fi
 fi
 
-ensure_mcp_cached
+ensure_mcp_cached || true
 resolve_and_exec_mcp "$@"

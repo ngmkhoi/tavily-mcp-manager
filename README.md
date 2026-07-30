@@ -133,16 +133,39 @@ State lives under `~/.tavily-mcp-manager`:
 | `TAVILY_HOME` | `~/.tavily-mcp-manager` | Manager home path |
 | `TAVILY_CONFIG_FILE` | — | Metadata config path |
 | `TAVILY_KEYS_FILE` | — | Secret key file path |
-| `TAVILY_NPM_CACHE` | `/tmp/tavily-mcp-npm-cache` | npm cache for MCP wrapper |
+| `TAVILY_NPM_CACHE` | `$TAVILY_HOME/npm-cache` | npm cache for MCP wrapper |
+| `TAVILY_MCP_VERSION` | `0.2.19` | Pinned `tavily-mcp` version |
+| `TAVILY_MCP_ALLOW_GLOBAL` | `0` | Set `1` to allow falling back to a global `tavily-mcp` |
 | `TAVILY_USAGE_WARNING_PERCENT` | `5` | Low-credit warning threshold |
 | `TAVILY_USAGE_STARTUP_CHECK` | `1` | Set `0` to skip startup checks |
+| `TAVILY_USAGE_CACHE_TTL_SECONDS` | `300` | Usage cache lifetime; `0` disables |
 | `TAVILY_AUTO_ROTATE` | `0` | Set `1` to rotate before startup |
 | `TAVILY_ROTATE_THRESHOLD_PERCENT` | — | Min remaining % for auto-rotate |
 | `TAVILY_PROJECT_ID` | — | Tavily project header for usage API |
 
+### Why the npm cache is not in /tmp
+
+macOS prunes files under `/tmp` that have not been accessed for a few days.
+Directories survive but individual files do not, which leaves a cache that
+still has its `node_modules/.bin/tavily-mcp` symlink while the packages it
+points into have lost their `package.json`. The server then dies at startup
+with `ERR_MODULE_NOT_FOUND`, surfacing in the agent as
+`-32000: Connection closed`.
+
+The wrapper now verifies that every cached package still has a readable
+`package.json` and that the cached version matches the pinned one, reinstalling
+automatically when either check fails. Point `TAVILY_NPM_CACHE` at `/tmp` again
+only if you want that behaviour back.
+
 ## Security
 
 - Keys stored in `~/.tavily-mcp-manager/keys.env`, never in repo
+- Values are written single-quoted, so nothing in a key is ever expanded as
+  shell syntax when the file is sourced. Files written by versions before 0.3.0
+  used double quotes and are migrated automatically on first run, with the
+  original kept as `keys.env.bak`
+- Config writes take a lock and land via atomic rename, so several agents
+  rotating at once cannot corrupt `config.json`
 - CLI masks key values in output
 - Recommended permissions:
 
@@ -181,5 +204,18 @@ dist/
 ```
 
 ```bash
-npm run check
+npm run check   # syntax only
+npm test        # behavioural suite
+```
+
+The suite needs no network and spends no credits: it runs against a mock
+`/usage` endpoint and a synthetic `node_modules` tree.
+
+```
+tests/
+  run.sh          # entry point; pass suite names to run a subset
+  helpers.sh      # assertions, sandboxes, mock curl
+  test_store.sh   # quoting, migration, CRUD, concurrent writes
+  test_cache.sh   # cache integrity and version pinning
+  test_rotate.sh  # rotation, shared accounts, usage cache, breakdown
 ```

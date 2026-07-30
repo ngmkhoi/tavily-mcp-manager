@@ -301,6 +301,19 @@ mcp_status() {
   ui_kv "auto rotate" "${TAVILY_AUTO_ROTATE:-0}"
   ui_kv "threshold" "${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}%"
   ui_kv "usage check" "${TAVILY_USAGE_STARTUP_CHECK:-0}"
-  ui_kv "npm cache" "${TAVILY_NPM_CACHE:-/tmp/tavily-mcp-npm-cache}"
+  ui_kv "usage cache" "${TAVILY_USAGE_CACHE_TTL_SECONDS:-300}s at $(usage_cache_dir)"
+
+  local cache_dir cache_stamp
+  cache_dir="${TAVILY_NPM_CACHE:-$tavily_home/npm-cache}"
+  cache_stamp="$cache_dir/.tavily-mcp-installed"
+  ui_kv "npm cache" "$cache_dir"
+  if [[ -f "$cache_stamp" ]]; then
+    ui_kv "cached" "$(cat "$cache_stamp" 2>/dev/null)"
+  else
+    ui_kv "cached" "${yellow}not installed yet${reset}"
+  fi
+  if [[ "$cache_dir" == /tmp/* || "$cache_dir" == /private/tmp/* ]]; then
+    ui_status "warning" "npm cache lives under /tmp, which the OS prunes; the install will eventually break" "$yellow"
+  fi
   print_store_paths
 }

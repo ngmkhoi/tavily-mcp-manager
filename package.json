@@ -1,6 +1,6 @@
 {
   "name": "tavily-mcp-manager",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "CLI and MCP wrapper for managing switchable Tavily API keys for AI coding agents.",
   "license": "MIT",
   "keywords": [
@@ -22,7 +22,8 @@
     "README.md"
   ],
   "scripts": {
-    "check": "bash -n src/cli/tavily-manager src/mcp/tavily-mcp-manager && node --check dist/cli.js && node --check dist/mcp-wrapper.js",
-    "prepack": "npm run check"
+    "check": "bash -n src/cli/tavily-manager src/cli/keys.sh src/cli/store.sh src/cli/ui.sh src/cli/usage.sh src/cli/mcp-config.sh src/mcp/tavily-mcp-manager && node --check dist/cli.js && node --check dist/mcp-wrapper.js",
+    "test": "bash tests/run.sh",
+    "prepack": "npm run check && npm test"
   }
 }
