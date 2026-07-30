@@ -15,7 +15,7 @@ trap cleanup_sandboxes EXIT
 
 suites=("$@")
 if [[ ${#suites[@]} -eq 0 ]]; then
-  suites=(store cache rotate)
+  suites=(store cache rotate install)
 fi
 
 for suite in "${suites[@]}"; do
