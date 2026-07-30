@@ -49,6 +49,56 @@ bar() {
   printf '%*s' "$empty" "" | tr ' ' '.'
 }
 
+usage_cache_dir() {
+  printf '%s' "${TAVILY_USAGE_CACHE_DIR:-$tavily_home/usage-cache}"
+}
+
+# Auto-rotate runs on every MCP startup and asks the API about every key.
+# Without a cache that is N sequential HTTPS round trips before the server can
+# accept its first request, which is why callers had to raise their startup
+# timeouts. A short TTL keeps rotation decisions fresh enough while making the
+# common startup cost zero.
+usage_cache_ttl() {
+  printf '%s' "${TAVILY_USAGE_CACHE_TTL_SECONDS:-300}"
+}
+
+usage_cache_read() {
+  local id="$1"
+  local ttl file age now mtime
+  ttl="$(usage_cache_ttl)"
+  [[ "$ttl" == "0" ]] && return 1
+
+  file="$(usage_cache_dir)/$id.json"
+  [[ -f "$file" ]] || return 1
+
+  now="$(date +%s)"
+  if ! mtime="$(stat -f '%m' "$file" 2>/dev/null)"; then
+    mtime="$(stat -c '%Y' "$file" 2>/dev/null)" || return 1
+  fi
+  age=$(( now - mtime ))
+  (( age < 0 )) && return 1
+  (( age >= ttl )) && return 1
+
+  cat "$file"
+}
+
+usage_cache_write() {
+  local id="$1"
+  local payload="$2"
+  local dir file
+  dir="$(usage_cache_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  chmod 700 "$dir" 2>/dev/null || true
+  file="$dir/$id.json"
+  printf '%s' "$payload" > "$file.tmp.$$" 2>/dev/null || return 0
+  chmod 600 "$file.tmp.$$" 2>/dev/null || true
+  mv -f "$file.tmp.$$" "$file" 2>/dev/null || rm -f "$file.tmp.$$"
+}
+
+usage_cache_clear() {
+  rm -rf "$(usage_cache_dir)"
+}
+
 usage_for_key() {
   local id="$1"
   local env_var key label
@@ -59,6 +109,12 @@ usage_for_key() {
   if [[ -z "$key" ]]; then
     echo "$id: missing key" >&2
     return 1
+  fi
+
+  local cached
+  if [[ "${TAVILY_USAGE_USE_CACHE:-0}" == "1" ]] && cached="$(usage_cache_read "$id")" && [[ -n "$cached" ]]; then
+    render_usage_payload "$cached" "$id" "$label" "$(mask_key "$key")"
+    return 0
   fi
 
   local curl_args=(
@@ -81,7 +137,12 @@ usage_for_key() {
     return 1
   fi
 
-  TAVILY_USAGE_RESPONSE="$response" node -e '
+  usage_cache_write "$id" "$response"
+  render_usage_payload "$response" "$id" "$label" "$(mask_key "$key")"
+}
+
+render_usage_payload() {
+  TAVILY_USAGE_RESPONSE="$1" node -e '
 const data = JSON.parse(process.env.TAVILY_USAGE_RESPONSE || "{}");
 const id = process.argv[1];
 const label = process.argv[2];
@@ -134,8 +195,21 @@ const accountLimit = planLimit + paygoLimit;
 
 const keyTotal = recordFor("key", keyUsed, keyLimit);
 const accountTotal = recordFor("account", accountUsed, accountLimit);
+
+// Two keys issued under the same Tavily account report identical account
+// figures. Rotating between them buys nothing, so surface enough for the
+// caller to notice.
+const fingerprint = [
+  account.current_plan || "unknown",
+  planLimit,
+  planUsed,
+  paygoLimit,
+  paygoUsed
+].join(":");
+
 const rows = [
   `META|${id}|${label}|${maskedKey}|${account.current_plan || "unknown"}|${warningPercent}`,
+  `FINGERPRINT|${fingerprint}`,
   `ROW|${keyTotal.scope}|${keyTotal.used}|${keyTotal.limit}|${keyTotal.remaining}|${keyTotal.percent}|${keyTotal.warning ? "1" : "0"}`,
   `BREAKDOWN|key|${number(key.search_usage)}|${number(key.extract_usage)}|${number(key.crawl_usage)}|${number(key.map_usage)}|${number(key.research_usage)}`
 ];
@@ -148,7 +222,7 @@ if (accountLimit || account.current_plan) {
 }
 
 console.log(rows.join("\n"));
-' "$id" "$label" "$(mask_key "$key")" "${TAVILY_USAGE_WARNING_PERCENT:-5}"
+' "$2" "$3" "$4" "${TAVILY_USAGE_WARNING_PERCENT:-5}"
 }
 
 render_usage() {
@@ -208,15 +282,56 @@ render_usage() {
   done
 
   printf '\n'
-  section_title "Breakdown"
-  printf '%-10s %9s %9s %9s %9s %9s\n' "Scope" "Search" "Extract" "Crawl" "Map" "Research"
-  printf '%-10s %9s %9s %9s %9s %9s\n' "----------" "---------" "---------" "---------" "---------" "---------"
+  section_title "Credits by endpoint"
+  printf '%-10s %9s %9s %9s %9s %9s %9s\n' "Scope" "Search" "Extract" "Crawl" "Map" "Research" "Total"
+  printf '%-10s %9s %9s %9s %9s %9s %9s\n' "----------" "---------" "---------" "---------" "---------" "---------" "---------"
 
-  local breakdown search extract crawl map research
+  local breakdown search extract crawl map research total
   for breakdown in "${breakdowns[@]}"; do
     IFS='|' read -r scope search extract crawl map research <<<"$breakdown"
-    printf '%-10s %9s %9s %9s %9s %9s\n' "$scope" "$search" "$extract" "$crawl" "$map" "$research"
+    total=$(( search + extract + crawl + map + research ))
+    printf '%-10s %9s %9s %9s %9s %9s %9s\n' "$scope" "$search" "$extract" "$crawl" "$map" "$research" "$total"
+    if (( total > 0 )); then
+      printf '%-10s %8s%% %8s%% %8s%% %8s%% %8s%% %9s\n' "${dim}share${reset}" \
+        "$(pct_of "$search" "$total")" \
+        "$(pct_of "$extract" "$total")" \
+        "$(pct_of "$crawl" "$total")" \
+        "$(pct_of "$map" "$total")" \
+        "$(pct_of "$research" "$total")" \
+        ""
+    fi
   done
+
+  # One research call can cost up to 250 credits against 1 for a basic search,
+  # so a large share here is the single most useful thing to notice.
+  local research_share=""
+  for breakdown in "${breakdowns[@]}"; do
+    IFS='|' read -r scope search extract crawl map research <<<"$breakdown"
+    total=$(( search + extract + crawl + map + research ))
+    if [[ "$scope" == "account" && "$total" -gt 0 ]]; then
+      research_share="$(pct_of "$research" "$total")"
+    fi
+  done
+  if [[ -n "$research_share" ]] && awk "BEGIN { exit !($research_share >= 50) }"; then
+    printf '\n'
+    ui_status "note" "research is ${research_share}% of spend; it costs 4-250 credits per call vs 1 for a basic search" "$yellow"
+  fi
+}
+
+pct_of() {
+  awk -v part="$1" -v total="$2" 'BEGIN { if (total <= 0) printf "0.0"; else printf "%.1f", (part * 100 / total) }'
+}
+
+fingerprint_for_raw_usage() {
+  local line
+  while IFS= read -r line; do
+    IFS='|' read -r type c1 _ <<<"$line"
+    if [[ "$type" == "FINGERPRINT" ]]; then
+      printf '%s' "$c1"
+      return 0
+    fi
+  done <<<"$1"
+  return 1
 }
 
 candidate_for_raw_usage() {
@@ -276,6 +391,40 @@ usage_summary_row() {
   printf '%-16s %-9s %8s %8s %8s %8s %b\n' "$(key_title "$key_id" "$label")" "$scope" "$used" "$limit" "$remaining" "$percent_text" "$status"
 }
 
+# Keys without a per-key limit fall back to account-scope figures. If several
+# keys sit on the same account those figures are identical, so rotating between
+# them frees no credits at all while still reporting success. The account
+# figures are all the API exposes, so this is a strong hint rather than proof —
+# worded accordingly.
+warn_shared_accounts() {
+  local entries=("$@")
+  (( ${#entries[@]} < 2 )) && return 0
+
+  local groups line id fingerprint
+  groups="$(
+    for line in "${entries[@]}"; do
+      [[ -z "$line" ]] && continue
+      IFS='|' read -r id fingerprint <<<"$line"
+      [[ -z "$fingerprint" ]] && continue
+      printf '%s\t%s\n' "$fingerprint" "$id"
+    done | sort
+  )"
+  [[ -z "$groups" ]] && return 0
+
+  local dup_prints
+  dup_prints="$(printf '%s\n' "$groups" | cut -f1 | uniq -d)"
+  [[ -z "$dup_prints" ]] && return 0
+
+  local print members
+  while IFS= read -r print; do
+    [[ -z "$print" ]] && continue
+    members="$(printf '%s\n' "$groups" | awk -F'\t' -v p="$print" '$1 == p { printf "#%s ", $2 }')"
+    ui_status "warning" "keys ${members%% } report identical account credits — they likely share one Tavily account, so rotating between them frees nothing" "$yellow"
+  done <<<"$dup_prints"
+
+  printf '\n'
+}
+
 rotate_key() {
   local dry_run=0
   local min_remaining="${TAVILY_ROTATE_THRESHOLD_PERCENT:-${TAVILY_USAGE_WARNING_PERCENT:-5}}"
@@ -315,7 +464,8 @@ rotate_key() {
   local best=""
   local current_candidate=""
   local candidates=()
-  local id raw candidate percent
+  local fingerprints=()
+  local id raw candidate percent fingerprint
 
   while IFS='|' read -r id _ _; do
     if [[ -z "$(key_for_id "$id")" ]]; then
@@ -323,6 +473,9 @@ rotate_key() {
     fi
     if raw="$(usage_for_key "$id" 2>/dev/null)" && candidate="$(candidate_for_raw_usage "$raw")"; then
       candidates+=("$candidate")
+      if fingerprint="$(fingerprint_for_raw_usage "$raw")"; then
+        fingerprints+=("$id|$fingerprint")
+      fi
       if [[ "$id" == "$current" ]]; then
         current_candidate="$candidate"
       fi
@@ -355,11 +508,13 @@ rotate_key() {
       ui_status "skipped" "active key #$current is above threshold" "$yellow"
       ui_kv "remaining" "${current_percent}%"
       ui_kv "threshold" "${only_if_current_below}%"
+      warn_shared_accounts "${fingerprints[@]:-}"
       exit 0
     fi
   fi
 
   headline
+  warn_shared_accounts "${fingerprints[@]:-}"
   if [[ "$dry_run" == "1" ]]; then
     ui_status "dry run" "#$current -> $(key_title "$best_id" "$best_label")" "$yellow"
   else
